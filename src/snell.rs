@@ -392,12 +392,17 @@ async fn handle_server_conn(stream: TcpStream, psk: &str, obfs_type: &str) -> io
         }
 
         match command {
-            CMD_CONNECT => is_v2 = false,
+            CMD_CONNECT => {
+                is_v2 = false;
+                log::debug!("snell v1 connection");
+            }
             CMD_UDP => {
                 handle_udp_request(&mut conn).await?;
                 break;
             }
-            CMD_CONNECT_V2 => {}
+            CMD_CONNECT_V2 => {
+                log::debug!("snell v2 connection");
+            }
             _ => {
                 log::error!("unknown command 0x{:x}", command);
                 break;
@@ -418,6 +423,11 @@ async fn handle_server_conn(stream: TcpStream, psk: &str, obfs_type: &str) -> io
 
         // Relay
         let relay_result = relay_conn_to_tcp(&mut conn, tc).await;
+        if let Err(e) = &relay_result {
+            if e.kind() != io::ErrorKind::UnexpectedEof {
+                log::warn!("relay to {} ended with error: {}", target, e);
+            }
+        }
 
         if is_v2 {
             // Write zero chunk back
@@ -445,8 +455,6 @@ async fn handle_server_conn(stream: TcpStream, psk: &str, obfs_type: &str) -> io
         } else {
             break;
         }
-
-        let _ = relay_result;
     }
 
     Ok(())
@@ -735,32 +743,54 @@ async fn write_header(conn: &mut SnellConn, target: &str, is_v2: bool) -> io::Re
 // ---- Relay ----
 
 /// Relay between a SnellConn and a TcpStream (server mode: snell is left, target is right).
+/// Handles half-close: when one direction gets EOF, only shuts down that direction.
 async fn relay_conn_to_tcp(snell: &mut SnellConn, target: TcpStream) -> io::Result<()> {
     let (mut target_read, mut target_write) = tokio::io::split(target);
 
     let mut snell_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut target_buf = vec![0u8; RELAY_BUF_SIZE];
 
+    let mut snell_eof = false;
+    let mut target_eof = false;
+
     loop {
+        if snell_eof && target_eof {
+            break Ok(());
+        }
+
         tokio::select! {
-            r = snell.snell_read(&mut snell_buf) => {
+            r = async { if snell_eof { std::future::pending().await } else { snell.snell_read(&mut snell_buf).await } } => {
                 match r {
-                    Ok(0) => break Ok(()),
+                    Ok(0) => {
+                        snell_eof = true;
+                        let _ = target_write.shutdown().await;
+                    }
                     Ok(n) => {
                         if let Err(e) = target_write.write_all(&snell_buf[..n]).await {
                             break Err(e);
                         }
                     }
+                    Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        snell_eof = true;
+                        let _ = target_write.shutdown().await;
+                    }
                     Err(e) => break Err(e),
                 }
             }
-            r = target_read.read(&mut target_buf) => {
+            r = async { if target_eof { std::future::pending().await } else { target_read.read(&mut target_buf).await } } => {
                 match r {
-                    Ok(0) => break Ok(()),
+                    Ok(0) => {
+                        target_eof = true;
+                        let _ = snell.write_zero_chunk().await;
+                    }
                     Ok(n) => {
                         if let Err(e) = snell.snell_write(&target_buf[..n]).await {
                             break Err(e);
                         }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        target_eof = true;
+                        let _ = snell.write_zero_chunk().await;
                     }
                     Err(e) => break Err(e),
                 }
