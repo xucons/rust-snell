@@ -186,16 +186,25 @@ impl SnellConn {
                 Ok(h) => h,
                 Err(_) => {
                     let fb = self.fallback_aead.take().unwrap();
-                    let h = fb.decrypt(&self.read_nonce, &enc_header)
-                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                    self.read_aead = Some(fb);
-                    self.switched = true;
-                    h
+                    match fb.decrypt(&self.read_nonce, &enc_header) {
+                        Ok(h) => {
+                            log::info!("cipher fallback to chacha20-poly1305");
+                            self.read_aead = Some(fb);
+                            self.switched = true;
+                            h
+                        }
+                        Err(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                "aead decrypt failed: both aes-128-gcm and chacha20-poly1305 failed, likely PSK mismatch",
+                            ));
+                        }
+                    }
                 }
             }
         } else {
             self.read_aead.as_ref().unwrap().decrypt(&self.read_nonce, &enc_header)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("aead decrypt failed: {}", e)))?
         };
         aead::increment_nonce(&mut self.read_nonce);
 
