@@ -322,7 +322,11 @@ impl SnellConn {
 
 pub async fn run_server(listen: &str, psk: &str, obfs_type: &str) -> io::Result<()> {
     let listener = TcpListener::bind(listen).await?;
-    log::info!("snell server listening at: {}", listen);
+    log::info!(
+        "snell server listening at: {}, obfs: {}",
+        listen,
+        if obfs_type.is_empty() { "none" } else { obfs_type }
+    );
 
     let psk = psk.to_string();
     let obfs_type = obfs_type.to_string();
@@ -331,12 +335,14 @@ pub async fn run_server(listen: &str, psk: &str, obfs_type: &str) -> io::Result<
         let (stream, addr) = listener.accept().await?;
         let psk = psk.clone();
         let obfs_type = obfs_type.clone();
+        log::info!("connection from {}", addr);
         tokio::spawn(async move {
             if let Err(e) = handle_server_conn(stream, &psk, &obfs_type).await {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
                     log::warn!("connection from {} error: {}", addr, e);
                 }
             }
+            log::info!("connection from {} closed", addr);
         });
     }
 }
@@ -603,7 +609,14 @@ impl SnellClient {
 
     pub async fn run(&self, listen: &str) -> io::Result<()> {
         let listener = TcpListener::bind(listen).await?;
-        log::info!("SOCKS proxy listening at: {}", listen);
+        log::info!(
+            "SOCKS proxy listening at: {}, server: {}, obfs: {}, obfs_host: {}, snell_v{}",
+            listen,
+            self.server,
+            if self.obfs.is_empty() { "none" } else { &self.obfs },
+            self.obfs_host,
+            if self.is_v2 { 2 } else { 1 }
+        );
 
         loop {
             let (stream, _) = listener.accept().await?;
