@@ -9,7 +9,7 @@ pub const PAYLOAD_SIZE_MASK: usize = 0x3FFF;
 pub const SALT_SIZE: usize = 16;
 
 fn snell_kdf(psk: &[u8], salt: &[u8], key_size: usize) -> Vec<u8> {
-    let params = Params::new(8 * 1024, 3, 1, Some(ARGON2_OUTPUT_LEN)).unwrap();
+    let params = Params::new(8, 3, 1, Some(ARGON2_OUTPUT_LEN)).unwrap();
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut output = vec![0u8; ARGON2_OUTPUT_LEN];
     argon2.hash_password_into(psk, salt, &mut output).unwrap();

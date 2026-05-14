@@ -246,7 +246,17 @@ impl SnellConn {
             self.init_reader().await?;
         }
 
-        self.read_record(buf).await
+        let result = self.read_record(buf).await;
+
+        // Switch write cipher if read cipher was switched (v1 fallback)
+        if self.switched {
+            if let Some(fb_cipher) = self.fallback_cipher.take() {
+                self.cipher = fb_cipher;
+            }
+            self.switched = false;
+        }
+
+        result
     }
 
     /// Write plaintext to the AEAD stream.
