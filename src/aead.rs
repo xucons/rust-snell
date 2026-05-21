@@ -16,9 +16,7 @@ fn snell_kdf(psk: &[u8], salt: &[u8], key_size: usize) -> Vec<u8> {
     output[..key_size].to_vec()
 }
 
-#[allow(dead_code)]
 pub trait Cipher: Send + Sync {
-    fn key_size(&self) -> usize;
     fn encrypter(&self, salt: &[u8]) -> Box<dyn AeadCipher>;
     fn decrypter(&self, salt: &[u8]) -> Box<dyn AeadCipher>;
 }
@@ -33,7 +31,6 @@ pub trait AeadCipher: Send + Sync {
 struct Aes128GcmCipher { psk: Vec<u8> }
 
 impl Cipher for Aes128GcmCipher {
-    fn key_size(&self) -> usize { 16 }
     fn encrypter(&self, salt: &[u8]) -> Box<dyn AeadCipher> {
         let key = snell_kdf(&self.psk, salt, 16);
         Box::new(Aes128GcmAead { cipher: Aes128Gcm::new_from_slice(&key).unwrap() })
@@ -62,7 +59,6 @@ impl AeadCipher for Aes128GcmAead {
 struct ChaCha20Poly1305Cipher { psk: Vec<u8> }
 
 impl Cipher for ChaCha20Poly1305Cipher {
-    fn key_size(&self) -> usize { 32 }
     fn encrypter(&self, salt: &[u8]) -> Box<dyn AeadCipher> {
         let key = snell_kdf(&self.psk, salt, 32);
         Box::new(ChaCha20Aead { cipher: ChaCha20Poly1305::new_from_slice(&key).unwrap() })

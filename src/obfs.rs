@@ -445,10 +445,8 @@ fn chrono_now_rfc1123() -> String {
 
     // Calculate date from days since epoch
     let (year, month, day) = days_to_date(days_since_epoch);
-    let weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let _weekday = weekdays[((days_since_epoch + 3) % 7) as usize]; // 1970-01-01 was Thursday, +3 to get to Mon=0
-    let weekday = weekdays[((4 + days_since_epoch) % 7) as usize];
+    let weekday = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][((4 + days_since_epoch) % 7) as usize];
     format!("{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT", weekday, day, months[month as usize - 1], year, hour, minute, second)
 }
 
