@@ -1,8 +1,13 @@
+use std::cmp::min;
 use std::io;
+use std::net::IpAddr;
+use std::num::NonZeroUsize;
+use std::time::Duration;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use crate::aead::{self, AeadCipher, Cipher, PAYLOAD_SIZE_MASK, SALT_SIZE};
+use crate::aead::{self, AeadCipher, Cipher, CipherKind, PAYLOAD_SIZE_MASK, SALT_SIZE};
 use crate::obfs::{ObfsMode, ObfsState};
 use crate::socks5;
 
@@ -21,60 +26,105 @@ pub const RESP_ERROR: u8 = 2;
 pub const SNELL_VERSION: u8 = 1;
 
 const RELAY_BUF_SIZE: usize = 20 * 1024;
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const READ_CHUNK: usize = 8192;
+const STAGING_COMPACT_THRESHOLD: usize = 64 * 1024;
 
+/// Snell 连接上的错误。零长度分片是正常的流结束信号，因此和 I/O 错误分开表示。
 #[derive(Debug)]
-pub struct ZeroChunkError;
+pub enum SnellError {
+    Io(io::Error),
+    ZeroChunk,
+}
 
-impl std::fmt::Display for ZeroChunkError {
+impl std::fmt::Display for SnellError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Snell ZERO_CHUNK occurred")
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::ZeroChunk => f.write_str("snell zero chunk"),
+        }
     }
 }
-impl std::error::Error for ZeroChunkError {}
+
+impl std::error::Error for SnellError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::ZeroChunk => None,
+        }
+    }
+}
+
+impl From<io::Error> for SnellError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl SnellError {
+    /// 对端正常关闭时的错误：零分片、EOF 或连接重置。
+    fn is_eof(&self) -> bool {
+        match self {
+            Self::ZeroChunk => true,
+            Self::Io(error) => matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+            ),
+        }
+    }
+
+    fn is_quiet(&self) -> bool {
+        self.is_eof()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReadState {
+    Header,
+    Payload { size: usize },
+}
 
 /// A Snell connection with AEAD encryption and optional obfuscation.
 pub struct SnellConn {
     stream: TcpStream,
     obfs: ObfsState,
-    cipher: Box<dyn Cipher>,
-    fallback_cipher: Option<Box<dyn Cipher>>,
-    read_aead: Option<Box<dyn AeadCipher>>,
-    write_aead: Option<Box<dyn AeadCipher>>,
-    fallback_aead: Option<Box<dyn AeadCipher>>,
+    cipher: Cipher,
+    fallback_cipher: Option<Cipher>,
+    read_aead: Option<AeadCipher>,
+    write_aead: Option<AeadCipher>,
+    fallback_aead: Option<AeadCipher>,
     read_nonce: Vec<u8>,
     write_nonce: Vec<u8>,
-    // Buffer for de-obfuscated but still AEAD-encrypted data
-    enc_buf: Vec<u8>,
-    enc_pos: usize,
-    // Buffer for AEAD-decrypted but not yet consumed data
+    // 已从 obfs 层读出、尚未解析成完整 AEAD 帧的密文
+    staging: Vec<u8>,
+    staging_pos: usize,
+    // 已解密、尚未被调用方消费的明文
     dec_leftover: Vec<u8>,
-    switched: bool,
+    read_state: ReadState,
 }
 
 impl SnellConn {
-    pub fn new_server_conn(stream: TcpStream, psk: &[u8], obfs_type: &str) -> io::Result<Self> {
-        let cipher = aead::new_aes128_gcm(psk);
-        let fallback_cipher = Some(aead::new_chacha20_poly1305(psk));
-        let obfs_mode = match obfs_type {
-            "tls" => ObfsMode::TlsServer,
-            "http" => ObfsMode::HttpServer,
-            _ => ObfsMode::None,
+    pub fn new_server_conn(stream: TcpStream, psk: &[u8], obfs_type: &str) -> Self {
+        let obfs = match obfs_type {
+            "tls" => ObfsState::new(ObfsMode::TlsServer),
+            "http" => ObfsState::new(ObfsMode::HttpServer),
+            _ => ObfsState::new(ObfsMode::None),
         };
-        Ok(Self {
+        Self {
             stream,
-            obfs: ObfsState::new(obfs_mode),
-            cipher,
-            fallback_cipher,
+            obfs,
+            cipher: Cipher::new(CipherKind::Aes128Gcm, psk),
+            fallback_cipher: Some(Cipher::new(CipherKind::ChaCha20Poly1305, psk)),
             read_aead: None,
             write_aead: None,
             fallback_aead: None,
             read_nonce: Vec::new(),
             write_nonce: Vec::new(),
-            enc_buf: Vec::new(),
-            enc_pos: 0,
+            staging: Vec::new(),
+            staging_pos: 0,
             dec_leftover: Vec::new(),
-            switched: false,
-        })
+            read_state: ReadState::Header,
+        }
     }
 
     pub fn new_client_conn(
@@ -84,193 +134,223 @@ impl SnellConn {
         obfs_host: &str,
         server_port: &str,
         is_v2: bool,
-    ) -> io::Result<Self> {
-        let cipher = if is_v2 {
-            aead::new_aes128_gcm(psk)
+    ) -> Self {
+        let obfs = match obfs_type {
+            "tls" => ObfsState::new(ObfsMode::TlsClient).with_server(obfs_host, server_port),
+            "http" => ObfsState::new(ObfsMode::HttpClient).with_server(obfs_host, server_port),
+            _ => ObfsState::new(ObfsMode::None),
+        };
+        let kind = if is_v2 {
+            CipherKind::Aes128Gcm
         } else {
-            aead::new_chacha20_poly1305(psk)
+            CipherKind::ChaCha20Poly1305
         };
-        let obfs_mode = match obfs_type {
-            "tls" => ObfsMode::TlsClient { host: obfs_host.to_string() },
-            "http" => ObfsMode::HttpClient { host: obfs_host.to_string(), port: server_port.to_string() },
-            _ => ObfsMode::None,
-        };
-        Ok(Self {
+        Self {
             stream,
-            obfs: ObfsState::new(obfs_mode),
-            cipher,
+            obfs,
+            cipher: Cipher::new(kind, psk),
             fallback_cipher: None,
             read_aead: None,
             write_aead: None,
             fallback_aead: None,
             read_nonce: Vec::new(),
             write_nonce: Vec::new(),
-            enc_buf: Vec::new(),
-            enc_pos: 0,
+            staging: Vec::new(),
+            staging_pos: 0,
             dec_leftover: Vec::new(),
-            switched: false,
-        })
+            read_state: ReadState::Header,
+        }
     }
 
-    /// Read exactly N bytes from the obfs layer into enc_buf, then copy to `buf`.
-    async fn obfs_read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            // Drain enc_buf first
-            if self.enc_pos < self.enc_buf.len() {
-                let n = std::cmp::min(buf.len() - filled, self.enc_buf.len() - self.enc_pos);
-                buf[filled..filled + n].copy_from_slice(&self.enc_buf[self.enc_pos..self.enc_pos + n]);
-                self.enc_pos += n;
-                filled += n;
-                continue;
-            }
-            // Reset buffer
-            self.enc_buf.clear();
-            self.enc_pos = 0;
+    fn staged_len(&self) -> usize {
+        self.staging.len() - self.staging_pos
+    }
 
-            // Read from obfs layer
-            let mut tmp = vec![0u8; 4096];
-            let n = self.obfs.read(&mut self.stream, &mut tmp).await?;
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
+    fn take_staged(&mut self, n: usize) -> Vec<u8> {
+        debug_assert!(self.staged_len() >= n);
+        let start = self.staging_pos;
+        self.staging_pos += n;
+        let out = self.staging[start..start + n].to_vec();
+        if self.staging_pos == self.staging.len() {
+            self.staging.clear();
+            self.staging_pos = 0;
+        } else if self.staging_pos >= STAGING_COMPACT_THRESHOLD {
+            self.staging.drain(..self.staging_pos);
+            self.staging_pos = 0;
+        }
+        out
+    }
+
+    /// 确保暂存区至少持有 `needed` 个字节。
+    ///
+    /// 该函数可安全取消：从 socket 读到的字节会立即保存到 `self.staging`，且
+    /// `staging_pos` 只有在整帧解析完成后才会推进。
+    async fn ensure_staged(&mut self, needed: usize) -> io::Result<()> {
+        while self.staged_len() < needed {
+            let mut chunk = [0u8; READ_CHUNK];
+            let read = self.obfs.read(&mut self.stream, &mut chunk).await?;
+            if read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed",
+                ));
             }
-            self.enc_buf.extend_from_slice(&tmp[..n]);
+            self.staging.extend_from_slice(&chunk[..read]);
         }
         Ok(())
     }
 
-    /// Initialize the AEAD reader by reading the salt from the peer.
+    /// 读取 salt 并初始化读方向的 AEAD 状态。
     async fn init_reader(&mut self) -> io::Result<()> {
-        let mut salt = vec![0u8; SALT_SIZE];
-        self.obfs_read_exact(&mut salt).await?;
+        self.ensure_staged(SALT_SIZE).await?;
+        let salt = self.take_staged(SALT_SIZE);
 
-        let primary = self.cipher.decrypter(&salt);
-        self.read_nonce = vec![0u8; primary.nonce_size()];
+        let primary = self.cipher.aead(&salt);
+        self.read_nonce = vec![0u8; AeadCipher::NONCE_SIZE];
         self.read_aead = Some(primary);
 
-        // Prepare fallback AEAD for the first record
-        if let Some(ref fb_cipher) = self.fallback_cipher {
-            self.fallback_aead = Some(fb_cipher.decrypter(&salt));
+        if let Some(fallback) = &self.fallback_cipher {
+            self.fallback_aead = Some(fallback.aead(&salt));
         }
         Ok(())
     }
 
-    /// Initialize the AEAD writer by generating and sending a salt.
+    /// 生成 salt 并发送，初始化写方向的 AEAD 状态。
     async fn init_writer(&mut self) -> io::Result<()> {
-        let mut salt = vec![0u8; SALT_SIZE];
-        {
-            use rand::RngCore;
-            let mut rng = rand::thread_rng();
-            rng.fill_bytes(&mut salt[..]);
-        }
-        let enc = self.cipher.encrypter(&salt);
+        use rand::RngCore;
+
+        let mut salt = [0u8; SALT_SIZE];
+        rand::thread_rng().fill_bytes(&mut salt);
+        let aead = self.cipher.aead(&salt);
         self.obfs.write(&mut self.stream, &salt).await?;
-        self.write_aead = Some(enc);
-        self.write_nonce = vec![0u8; self.write_aead.as_ref().unwrap().nonce_size()];
+        self.write_nonce = vec![0u8; AeadCipher::NONCE_SIZE];
+        self.write_aead = Some(aead);
         Ok(())
     }
 
-    /// Read and decrypt a single AEAD record.
-    async fn read_record(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let overhead = self.read_aead.as_ref().unwrap().tag_size();
+    async fn read_header(&mut self) -> Result<Vec<u8>, SnellError> {
+        self.ensure_staged(2 + AeadCipher::TAG_SIZE).await?;
+        let encrypted = self.take_staged(2 + AeadCipher::TAG_SIZE);
+        self.decrypt_header(&encrypted)
+    }
 
-        // Read encrypted header (2 bytes + tag)
-        let header_enc_size = 2 + overhead;
-        let mut enc_header = vec![0u8; header_enc_size];
-        self.obfs_read_exact(&mut enc_header).await?;
+    /// 解密头部，必要时在首条记录上回退到 ChaCha20-Poly1305。
+    fn decrypt_header(&mut self, encrypted: &[u8]) -> Result<Vec<u8>, SnellError> {
+        let primary_result = self
+            .read_aead
+            .as_ref()
+            .expect("read cipher initialized")
+            .decrypt(&self.read_nonce, encrypted);
 
-        // Try decrypt with primary, fall back if needed
-        let header = if self.fallback_aead.is_some() {
-            let primary = self.read_aead.as_ref().unwrap();
-            match primary.decrypt(&self.read_nonce, &enc_header) {
-                Ok(h) => h,
-                Err(_) => {
-                    let fb = self.fallback_aead.take().unwrap();
-                    match fb.decrypt(&self.read_nonce, &enc_header) {
-                        Ok(h) => {
-                            log::info!("cipher fallback to chacha20-poly1305");
-                            self.read_aead = Some(fb);
-                            self.switched = true;
-                            h
-                        }
-                        Err(_) => {
+        match primary_result {
+            Ok(header) => {
+                aead::increment_nonce(&mut self.read_nonce);
+                // 首条记录已确认密码套件，回退不再需要
+                self.fallback_aead = None;
+                self.fallback_cipher = None;
+                Ok(header)
+            }
+            Err(primary_error) => {
+                let Some(fallback) = self.fallback_aead.take() else {
+                    return Err(io::Error::other(primary_error).into());
+                };
+                match fallback.decrypt(&self.read_nonce, encrypted) {
+                    Ok(header) => {
+                        if self.write_aead.is_some() {
                             return Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                "aead decrypt failed: both aes-128-gcm and chacha20-poly1305 failed, likely PSK mismatch",
-                            ));
+                                io::ErrorKind::InvalidData,
+                                "cipher fallback after the write cipher was initialized",
+                            )
+                            .into());
                         }
+                        log::info!("cipher fallback to chacha20-poly1305");
+                        self.read_aead = Some(fallback);
+                        self.cipher = self
+                            .fallback_cipher
+                            .take()
+                            .expect("fallback cipher accompanies fallback AEAD");
+                        aead::increment_nonce(&mut self.read_nonce);
+                        Ok(header)
                     }
+                    Err(_) => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "AEAD decrypt failed with both aes-128-gcm and chacha20-poly1305, likely PSK mismatch",
+                    )
+                    .into()),
                 }
             }
-        } else {
-            self.read_aead.as_ref().unwrap().decrypt(&self.read_nonce, &enc_header)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("aead decrypt failed: {}", e)))?
-        };
-        aead::increment_nonce(&mut self.read_nonce);
-
-        let size = ((header[0] as usize) << 8 | header[1] as usize) & PAYLOAD_SIZE_MASK;
-        if size == 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, ZeroChunkError));
         }
-
-        // Read encrypted payload
-        let payload_enc_size = size + overhead;
-        let mut enc_payload = vec![0u8; payload_enc_size];
-        self.obfs_read_exact(&mut enc_payload).await?;
-
-        let payload = self.read_aead.as_ref().unwrap().decrypt(&self.read_nonce, &enc_payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        aead::increment_nonce(&mut self.read_nonce);
-
-        let n = std::cmp::min(buf.len(), payload.len());
-        buf[..n].copy_from_slice(&payload[..n]);
-        if n < payload.len() {
-            self.dec_leftover = payload[n..].to_vec();
-        }
-
-        Ok(n)
     }
 
-    /// Read plaintext from the AEAD stream.
-    pub async fn snell_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // Return decrypted leftover first
+    async fn read_payload(&mut self, size: usize) -> Result<Vec<u8>, SnellError> {
+        self.ensure_staged(size + AeadCipher::TAG_SIZE).await?;
+        let encrypted = self.take_staged(size + AeadCipher::TAG_SIZE);
+        let payload = self
+            .read_aead
+            .as_ref()
+            .expect("read cipher initialized")
+            .decrypt(&self.read_nonce, &encrypted)
+            .map_err(io::Error::other)?;
+        aead::increment_nonce(&mut self.read_nonce);
+        Ok(payload)
+    }
+
+    /// 读取明文。
+    ///
+    /// 该函数可安全地被 `tokio::select!` 取消：所有中间状态（暂存密文、当前读取阶段、
+    /// nonce）都保存在 `self` 中，只有完整读取并解密一帧后才会推进状态。
+    pub async fn snell_read(&mut self, buf: &mut [u8]) -> Result<usize, SnellError> {
         if !self.dec_leftover.is_empty() {
-            let n = std::cmp::min(buf.len(), self.dec_leftover.len());
+            let n = min(buf.len(), self.dec_leftover.len());
             buf[..n].copy_from_slice(&self.dec_leftover[..n]);
             self.dec_leftover.drain(..n);
             return Ok(n);
         }
 
-        // Init reader if needed
         if self.read_aead.is_none() {
             self.init_reader().await?;
         }
 
-        let result = self.read_record(buf).await;
-
-        // Switch write cipher if read cipher was switched (v1 fallback)
-        if self.switched {
-            if let Some(fb_cipher) = self.fallback_cipher.take() {
-                self.cipher = fb_cipher;
+        loop {
+            match self.read_state {
+                ReadState::Header => {
+                    let header = self.read_header().await?;
+                    let size = ((usize::from(header[0]) << 8) | usize::from(header[1]))
+                        & PAYLOAD_SIZE_MASK;
+                    if size == 0 {
+                        return Err(SnellError::ZeroChunk);
+                    }
+                    self.read_state = ReadState::Payload { size };
+                }
+                ReadState::Payload { size } => {
+                    let payload = self.read_payload(size).await?;
+                    self.read_state = ReadState::Header;
+                    let n = min(buf.len(), payload.len());
+                    buf[..n].copy_from_slice(&payload[..n]);
+                    if n < payload.len() {
+                        self.dec_leftover = payload[n..].to_vec();
+                    }
+                    return Ok(n);
+                }
             }
-            self.switched = false;
         }
-
-        result
     }
 
-    /// Write plaintext to the AEAD stream.
-    pub async fn snell_write(&mut self, data: &[u8]) -> io::Result<usize> {
+    /// 写入明文。
+    pub async fn snell_write(&mut self, data: &[u8]) -> Result<usize, SnellError> {
         if self.write_aead.is_none() {
             self.init_writer().await?;
         }
 
         if data.is_empty() {
-            // Zero chunk
-            let aead = self.write_aead.as_ref().unwrap();
-            let encrypted = aead.encrypt(&self.write_nonce, &[0, 0])
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            aead::increment_nonce(&mut self.write_nonce);
+            let encrypted = {
+                let aead = self.write_aead.as_ref().expect("write cipher initialized");
+                let encrypted = aead
+                    .encrypt(&self.write_nonce, &[0, 0])
+                    .map_err(io::Error::other)?;
+                aead::increment_nonce(&mut self.write_nonce);
+                encrypted
+            };
             self.obfs.write(&mut self.stream, &encrypted).await?;
             return Ok(0);
         }
@@ -278,52 +358,59 @@ impl SnellConn {
         let data_len = data.len();
         let mut written = 0;
         while written < data_len {
-            let end = std::cmp::min(written + PAYLOAD_SIZE_MASK, data_len);
-            let chunk = &data[written..end];
-            self.write_chunk(chunk).await?;
+            let end = min(written + PAYLOAD_SIZE_MASK, data_len);
+            self.write_chunk(&data[written..end]).await?;
             written = end;
         }
         Ok(data_len)
     }
 
-    async fn write_chunk(&mut self, payload: &[u8]) -> io::Result<()> {
-        let aead = self.write_aead.as_ref().unwrap();
+    async fn write_chunk(&mut self, payload: &[u8]) -> Result<(), SnellError> {
         let payload_len = payload.len();
+        let header = u16::try_from(payload_len)
+            .expect("payload length <= PAYLOAD_SIZE_MASK")
+            .to_be_bytes();
 
-        // Encrypt header
-        let header = [(payload_len >> 8) as u8, (payload_len & 0xff) as u8];
-        let enc_header = aead.encrypt(&self.write_nonce, &header)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        aead::increment_nonce(&mut self.write_nonce);
+        let encrypted_header = {
+            let aead = self.write_aead.as_ref().expect("write cipher initialized");
+            let encrypted = aead
+                .encrypt(&self.write_nonce, &header)
+                .map_err(io::Error::other)?;
+            aead::increment_nonce(&mut self.write_nonce);
+            encrypted
+        };
 
-        // Encrypt payload
-        let enc_payload = aead.encrypt(&self.write_nonce, payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        aead::increment_nonce(&mut self.write_nonce);
+        let encrypted_payload = {
+            let aead = self.write_aead.as_ref().expect("write cipher initialized");
+            let encrypted = aead
+                .encrypt(&self.write_nonce, payload)
+                .map_err(io::Error::other)?;
+            aead::increment_nonce(&mut self.write_nonce);
+            encrypted
+        };
 
-        // Write through obfs
-        let mut out = Vec::with_capacity(enc_header.len() + enc_payload.len());
-        out.extend_from_slice(&enc_header);
-        out.extend_from_slice(&enc_payload);
+        let mut out = Vec::with_capacity(encrypted_header.len() + encrypted_payload.len());
+        out.extend_from_slice(&encrypted_header);
+        out.extend_from_slice(&encrypted_payload);
         self.obfs.write(&mut self.stream, &out).await?;
         Ok(())
     }
 
-    /// Write a zero chunk (for v2 multiplexing signal).
-    pub async fn write_zero_chunk(&mut self) -> io::Result<()> {
+    /// 写入零长度分片（v2 的半关闭信号）。
+    pub async fn write_zero_chunk(&mut self) -> Result<(), SnellError> {
         self.snell_write(&[]).await?;
         Ok(())
     }
 
-    /// Read the server's response byte.
-    pub async fn read_response(&mut self) -> io::Result<u8> {
+    /// 读取服务端应答字节。
+    pub async fn read_response(&mut self) -> Result<u8, SnellError> {
         let mut buf = [0u8; 1];
         self.snell_read(&mut buf).await?;
         Ok(buf[0])
     }
 
-    /// Read the error response details after getting RESP_ERROR.
-    pub async fn read_error_response(&mut self) -> io::Result<String> {
+    /// 在收到 `RESP_ERROR` 后读取错误详情。
+    pub async fn read_error_response(&mut self) -> Result<String, SnellError> {
         let mut code_buf = [0u8; 1];
         self.snell_read(&mut code_buf).await?;
         let mut len_buf = [0u8; 1];
@@ -342,130 +429,146 @@ impl SnellConn {
 pub async fn run_server(listen: &str, psk: &str, obfs_type: &str) -> io::Result<()> {
     let listener = TcpListener::bind(listen).await?;
     log::info!(
-        "snell server listening at: {}, obfs: {}",
-        listen,
-        if obfs_type.is_empty() { "none" } else { obfs_type }
+        "snell server listening at: {listen}, obfs: {}",
+        if obfs_type.is_empty() {
+            "none"
+        } else {
+            obfs_type
+        }
     );
 
     let psk = psk.to_string();
     let obfs_type = obfs_type.to_string();
 
     loop {
-        let (stream, addr) = listener.accept().await?;
+        let (stream, addr) = match listener.accept().await {
+            Ok(value) => value,
+            Err(error) => {
+                // 瞬时错误（如 EMFILE）不应终止整个服务
+                log::warn!("accept failed: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let psk = psk.clone();
         let obfs_type = obfs_type.clone();
-        log::info!("connection from {}", addr);
+        log::info!("connection from {addr}");
         tokio::spawn(async move {
-            if let Err(e) = handle_server_conn(stream, &psk, &obfs_type).await {
-                if e.kind() != io::ErrorKind::UnexpectedEof {
-                    log::warn!("connection from {} error: {}", addr, e);
+            if let Err(error) = handle_server_conn(stream, &psk, &obfs_type).await {
+                if !error.is_quiet() {
+                    log::warn!("connection from {addr} error: {error}");
                 }
             }
-            log::info!("connection from {} closed", addr);
+            log::info!("connection from {addr} closed");
         });
     }
 }
 
-async fn handle_server_conn(stream: TcpStream, psk: &str, obfs_type: &str) -> io::Result<()> {
-    let mut conn = SnellConn::new_server_conn(stream, psk.as_bytes(), obfs_type)?;
-
+async fn handle_server_conn(
+    stream: TcpStream,
+    psk: &str,
+    obfs_type: &str,
+) -> Result<(), SnellError> {
+    let mut conn = SnellConn::new_server_conn(stream, psk.as_bytes(), obfs_type);
     let mut is_v2 = true;
+    let mut first_handshake = true;
 
     loop {
-        let (target, command) = match server_handshake(&mut conn).await {
-            Ok(r) => r,
-            Err(e) => {
-                if e.kind() != io::ErrorKind::UnexpectedEof {
-                    log::warn!("handshake failed: {}", e);
+        let handshake = server_handshake(&mut conn);
+        let result = if first_handshake {
+            first_handshake = false;
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "snell handshake timed out",
+                    )
+                    .into());
+                }
+            }
+        } else {
+            handshake.await
+        };
+
+        let (target, command) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                if !error.is_quiet() {
+                    log::warn!("handshake failed: {error}");
                 }
                 break;
             }
         };
 
         if command != CMD_UDP {
-            log::info!("new target: {}", target);
-        }
-
-        if command == CMD_PING {
-            conn.snell_write(&[RESP_PONG]).await?;
-            break;
+            log::info!("new target: {target}");
         }
 
         match command {
+            CMD_PING => {
+                conn.snell_write(&[RESP_PONG]).await?;
+                break;
+            }
             CMD_CONNECT => {
                 is_v2 = false;
                 log::debug!("snell v1 connection");
+            }
+            CMD_CONNECT_V2 => {
+                log::debug!("snell v2 connection");
             }
             CMD_UDP => {
                 handle_udp_request(&mut conn).await?;
                 break;
             }
-            CMD_CONNECT_V2 => {
-                log::debug!("snell v2 connection");
-            }
             _ => {
-                log::error!("unknown command 0x{:x}", command);
+                log::error!("unknown command 0x{command:x}");
                 break;
             }
         }
 
-        // Connect to target
-        let tc = match TcpStream::connect(&target).await {
-            Ok(s) => s,
-            Err(e) => {
-                write_error(&mut conn, &e.to_string()).await?;
-                if !is_v2 { break; }
+        let target_stream = match TcpStream::connect(&target).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                write_error(&mut conn, &error.to_string()).await?;
+                if !is_v2 {
+                    break;
+                }
                 continue;
             }
         };
 
         conn.snell_write(&[RESP_TUNNEL]).await?;
 
-        // Relay
-        let relay_result = relay_conn_to_tcp(&mut conn, tc).await;
-        if let Err(e) = &relay_result {
-            if e.kind() != io::ErrorKind::UnexpectedEof {
-                log::warn!("relay to {} ended with error: {}", target, e);
-            }
-        }
-
-        if is_v2 {
-            // Write zero chunk back
-            if let Err(e) = conn.write_zero_chunk().await {
-                log::error!("zero chunk write error: {}", e);
-                return Ok(());
-            }
-
-            // Drain until zero chunk from client
-            let mut buf = vec![0u8; RELAY_BUF_SIZE];
-            loop {
-                match conn.snell_read(&mut buf).await {
-                    Ok(_) => continue,
-                    Err(e) => {
-                        if is_zero_chunk(&e) {
-                            break;
-                        }
-                        if e.kind() != io::ErrorKind::UnexpectedEof {
-                            log::warn!("unexpected error draining: {}", e);
-                        }
-                        break;
-                    }
+        match relay_conn_to_tcp(&mut conn, target_stream, is_v2).await {
+            Ok(()) => {
+                // v2：目标 EOF 时的零分片已经发出，连接可直接用于下一个 CONNECT。
+                if !is_v2 {
+                    break;
                 }
             }
-        } else {
-            break;
+            Err(error) => {
+                if !error.is_quiet() {
+                    log::warn!("relay to {target} ended with error: {error}");
+                }
+                break;
+            }
         }
     }
 
     Ok(())
 }
 
-async fn server_handshake(conn: &mut SnellConn) -> io::Result<(String, u8)> {
+async fn server_handshake(conn: &mut SnellConn) -> Result<(String, u8), SnellError> {
     let mut buf = [0u8; 3];
     conn.snell_read(&mut buf).await?;
 
     if buf[0] != SNELL_VERSION {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid snell version {:x}", buf[0])));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid snell version 0x{:x}", buf[0]),
+        )
+        .into());
     }
 
     let command = buf[1];
@@ -481,7 +584,6 @@ async fn server_handshake(conn: &mut SnellConn) -> io::Result<(String, u8)> {
         return Ok((String::new(), CMD_UDP));
     }
 
-    // Read host
     let mut hlen_buf = [0u8; 1];
     conn.snell_read(&mut hlen_buf).await?;
     let hlen = hlen_buf[0] as usize;
@@ -490,121 +592,151 @@ async fn server_handshake(conn: &mut SnellConn) -> io::Result<(String, u8)> {
     conn.snell_read(&mut host_port).await?;
 
     let host = String::from_utf8_lossy(&host_port[..hlen]).to_string();
-    let port = ((host_port[hlen] as u16) << 8) | host_port[hlen + 1] as u16;
+    let port = u16::from_be_bytes([host_port[hlen], host_port[hlen + 1]]);
 
-    Ok((format!("{}:{}", host, port), command))
+    Ok((format!("{host}:{port}"), command))
 }
 
-async fn write_error(conn: &mut SnellConn, msg: &str) -> io::Result<()> {
-    let mut buf = vec![RESP_ERROR, 0]; // code=0
+async fn write_error(conn: &mut SnellConn, msg: &str) -> Result<(), SnellError> {
     let msg_bytes = msg.as_bytes();
-    let truncated = if msg_bytes.len() > 250 { &msg_bytes[..250] } else { msg_bytes };
-    buf.push(truncated.len() as u8);
+    let truncated = &msg_bytes[..msg_bytes.len().min(250)];
+    let mut buf = vec![RESP_ERROR, 0];
+    buf.push(u8::try_from(truncated.len()).expect("truncated error message <= 250 bytes"));
     buf.extend_from_slice(truncated);
     conn.snell_write(&buf).await?;
     Ok(())
 }
 
-async fn handle_udp_request(conn: &mut SnellConn) -> io::Result<()> {
+async fn handle_udp_request(conn: &mut SnellConn) -> Result<(), SnellError> {
     log::info!("new UDP request");
 
     let udp_sock = UdpSocket::bind("0.0.0.0:0").await?;
     conn.snell_write(&[RESP_READY]).await?;
+    log::info!("UDP listening on: {}", udp_sock.local_addr()?);
 
-    let local_addr = udp_sock.local_addr()?;
-    log::info!("UDP listening on: {}", local_addr);
-
-    let mut cache = lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap());
+    let mut cache = lru::LruCache::new(NonZeroUsize::new(256).expect("256 is non-zero"));
     let mut buf = vec![0u8; RELAY_BUF_SIZE];
+    let mut udp_buf = vec![0u8; RELAY_BUF_SIZE];
 
     loop {
-        let n = match conn.snell_read(&mut buf).await {
-            Ok(n) => n,
-            Err(e) => {
-                if e.kind() == io::ErrorKind::UnexpectedEof {
-                    log::info!("UDP over TCP read EOF");
-                } else {
-                    log::error!("UDP over TCP read error: {}", e);
-                }
-                break;
-            }
-        };
+        tokio::select! {
+            read = conn.snell_read(&mut buf) => {
+                let n = match read {
+                    Ok(n) => n,
+                    Err(error) if error.is_eof() => {
+                        log::info!("UDP over TCP closed");
+                        break;
+                    }
+                    Err(error) => return Err(error),
+                };
 
-        if n < 5 {
-            log::error!("UDP insufficient chunk size: {} < 5", n);
-            break;
-        }
-
-        let cmd = buf[0];
-        let hlen = buf[1];
-
-        if cmd != CMD_UDP_FORWARD {
-            log::error!("UDP unknown command: 0x{:x}", cmd);
-            break;
-        }
-
-        let (host, head) = if hlen == 0 {
-            let ip_ver = buf[2];
-            let iplen = match ip_ver {
-                4 => 4usize,
-                6 => 16usize,
-                _ => {
-                    log::error!("unknown IP version: {}", ip_ver);
+                if n < 5 {
+                    log::error!("UDP insufficient chunk size: {n} < 5");
                     break;
                 }
-            };
-            let head = 3 + iplen;
-            if n < head + 2 {
-                log::error!("UDP insufficient chunk size");
-                break;
-            }
-            let ip_bytes = &buf[3..head];
-            let ip = if iplen == 4 {
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]))
-            } else {
-                let mut octets = [0u8; 16];
-                octets.copy_from_slice(ip_bytes);
-                std::net::IpAddr::V6(std::net::Ipv6Addr::from(octets))
-            };
-            (ip.to_string(), head)
-        } else {
-            let head = 2 + hlen as usize;
-            if n < head + 2 {
-                log::error!("UDP insufficient chunk size");
-                break;
-            }
-            (String::from_utf8_lossy(&buf[2..head]).to_string(), head)
-        };
 
-        let port = ((buf[head] as u16) << 8) | buf[head + 1] as u16;
-        let target = format!("{}:{}", host, port);
-        log::debug!("UDP over TCP forwarding to {}", target);
+                let cmd = buf[0];
+                let hlen = buf[1];
+                if cmd != CMD_UDP_FORWARD {
+                    log::error!("UDP unknown command: 0x{cmd:x}");
+                    break;
+                }
 
-        let uaddr = if let Some(&addr) = cache.get(&target) {
-            addr
-        } else {
-            match tokio::net::lookup_host(&target).await {
-                Ok(mut addrs) => {
-                    if let Some(addr) = addrs.next() {
-                        cache.put(target.clone(), addr);
-                        addr
+                let (host, head) = if hlen == 0 {
+                    let ip_ver = buf[2];
+                    let iplen = match ip_ver {
+                        4 => 4usize,
+                        6 => 16usize,
+                        _ => {
+                            log::error!("unknown IP version: {ip_ver}");
+                            break;
+                        }
+                    };
+                    let head = 3 + iplen;
+                    if n < head + 2 {
+                        log::error!("UDP insufficient chunk size");
+                        break;
+                    }
+                    let ip_bytes = &buf[3..head];
+                    let ip = if iplen == 4 {
+                        IpAddr::V4(std::net::Ipv4Addr::new(
+                            ip_bytes[0],
+                            ip_bytes[1],
+                            ip_bytes[2],
+                            ip_bytes[3],
+                        ))
                     } else {
-                        log::warn!("UDP failed to resolve {}", target);
+                        let mut octets = [0u8; 16];
+                        octets.copy_from_slice(ip_bytes);
+                        IpAddr::V6(std::net::Ipv6Addr::from(octets))
+                    };
+                    (ip.to_string(), head)
+                } else {
+                    let head = 2 + hlen as usize;
+                    if n < head + 2 {
+                        log::error!("UDP insufficient chunk size");
+                        break;
+                    }
+                    (String::from_utf8_lossy(&buf[2..head]).to_string(), head)
+                };
+
+                let port = u16::from_be_bytes([buf[head], buf[head + 1]]);
+                let target = format!("{host}:{port}");
+                log::debug!("UDP over TCP forwarding to {target}");
+
+                let uaddr = if let Some(&addr) = cache.get(&target) {
+                    addr
+                } else {
+                    match tokio::net::lookup_host(&target).await {
+                        Ok(mut addrs) => {
+                            if let Some(addr) = addrs.next() {
+                                cache.put(target.clone(), addr);
+                                addr
+                            } else {
+                                log::warn!("UDP failed to resolve {target}");
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("UDP failed to resolve {target}: {error}");
+                            continue;
+                        }
+                    }
+                };
+
+                let payload_start = head + 2;
+                if n > payload_start {
+                    udp_sock.send_to(&buf[payload_start..n], uaddr).await?;
+                }
+            }
+            recv = udp_sock.recv_from(&mut udp_buf) => {
+                let (n, from) = match recv {
+                    Ok(value) => value,
+                    Err(error) => {
+                        log::warn!("UDP recv error: {error}");
                         continue;
                     }
-                }
-                Err(e) => {
-                    log::warn!("UDP failed to resolve {}: {}", target, e);
-                    continue;
-                }
-            }
-        };
+                };
 
-        let payload_start = head + 2;
-        if n > payload_start {
-            if let Err(e) = udp_sock.send_to(&buf[payload_start..n], uaddr).await {
-                log::error!("UDP send error: {}", e);
-                break;
+                // 响应帧格式：[ipver(4|6)][addr][port_be][payload]
+                let mut frame = Vec::with_capacity(n + 19);
+                match from.ip() {
+                    IpAddr::V4(ip) => {
+                        frame.push(0x04);
+                        frame.extend_from_slice(&ip.octets());
+                    }
+                    IpAddr::V6(ip) => {
+                        frame.push(0x06);
+                        frame.extend_from_slice(&ip.octets());
+                    }
+                }
+                frame.extend_from_slice(&from.port().to_be_bytes());
+                frame.extend_from_slice(&udp_buf[..n]);
+
+                if let Err(error) = conn.snell_write(&frame).await {
+                    log::warn!("UDP response write error: {error}");
+                    break;
+                }
             }
         }
     }
@@ -637,102 +769,145 @@ impl SnellClient {
     pub async fn run(&self, listen: &str) -> io::Result<()> {
         let listener = TcpListener::bind(listen).await?;
         log::info!(
-            "SOCKS proxy listening at: {}, server: {}, obfs: {}, obfs_host: {}, snell_v{}",
-            listen,
+            "SOCKS proxy listening at: {listen}, server: {}, obfs: {}, obfs_host: {}, snell_v{}",
             self.server,
-            if self.obfs.is_empty() { "none" } else { &self.obfs },
+            if self.obfs.is_empty() {
+                "none"
+            } else {
+                &self.obfs
+            },
             self.obfs_host,
             if self.is_v2 { 2 } else { 1 }
         );
 
         loop {
-            let (stream, _) = listener.accept().await?;
+            let (stream, _) = match listener.accept().await {
+                Ok(value) => value,
+                Err(error) => {
+                    log::warn!("accept failed: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let client = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = client.handle_socks_conn(stream).await {
-                    log::warn!("socks connection error: {}", e);
+                if let Err(error) = client.handle_socks_conn(stream).await {
+                    if !error.is_quiet() {
+                        log::warn!("socks connection error: {error}");
+                    }
                 }
             });
         }
     }
 
-    async fn handle_socks_conn(&self, mut socks_stream: TcpStream) -> io::Result<()> {
+    async fn handle_socks_conn(&self, mut socks_stream: TcpStream) -> Result<(), SnellError> {
         let (addr, command) = socks5::server_handshake(&mut socks_stream).await?;
 
-        if command == socks5::CMD_UDP_ASSOCIATE {
-            let mut buf = vec![0u8; 1024];
-            loop {
-                match socks_stream.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    _ => {}
-                }
-            }
-            return Ok(());
-        }
-
-        let target = addr.to_string_addr();
-        log::info!("new target: {}", target);
-
-        let mut snell_conn = self.create_session(&target).await?;
-
-        // Read server response
-        let resp = snell_conn.read_response().await?;
-        if resp == RESP_ERROR {
-            let msg = snell_conn.read_error_response().await?;
-            return Err(io::Error::new(io::ErrorKind::Other, format!("server error: {}", msg)));
-        } else if resp != RESP_TUNNEL {
-            return Err(io::Error::new(io::ErrorKind::Other, "command not supported"));
-        }
-
-        // Relay
-        let _ = relay_tcp_to_conn(&mut socks_stream, &mut snell_conn).await;
-
-        if self.is_v2 {
-            if let Err(e) = snell_conn.write_zero_chunk().await {
-                log::error!("zero chunk write error: {}", e);
+        match command {
+            socks5::CMD_CONNECT => {}
+            socks5::CMD_UDP_ASSOCIATE => {
+                log::warn!("UDP ASSOCIATE is not supported");
+                socks5::send_reply(&mut socks_stream, socks5::REP_COMMAND_NOT_SUPPORTED).await?;
                 return Ok(());
             }
+            _ => {
+                socks5::send_reply(&mut socks_stream, socks5::REP_COMMAND_NOT_SUPPORTED).await?;
+                return Ok(());
+            }
+        }
 
-            // Drain until zero chunk
-            let mut buf = vec![0u8; RELAY_BUF_SIZE];
-            loop {
-                match snell_conn.snell_read(&mut buf).await {
-                    Ok(_) => continue,
-                    Err(e) => {
-                        if is_zero_chunk(&e) {
-                            break;
-                        }
-                        break;
-                    }
-                }
+        let target = addr.to_string_addr().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed SOCKS5 target address",
+            )
+        })?;
+        log::info!("new target: {target}");
+
+        let mut snell_conn = match self.create_session(&target).await {
+            Ok(conn) => conn,
+            Err(error) => {
+                let _ = socks5::send_reply(&mut socks_stream, socks5::REP_HOST_UNREACHABLE).await;
+                return Err(error);
+            }
+        };
+
+        let response = match snell_conn.read_response().await {
+            Ok(response) => response,
+            Err(error) => {
+                let _ = socks5::send_reply(&mut socks_stream, socks5::REP_GENERAL_FAILURE).await;
+                return Err(error);
+            }
+        };
+
+        if response == RESP_ERROR {
+            let message = snell_conn
+                .read_error_response()
+                .await
+                .unwrap_or_else(|error| format!("<failed to read error: {error}>"));
+            let _ = socks5::send_reply(&mut socks_stream, socks5::REP_HOST_UNREACHABLE).await;
+            return Err(io::Error::other(format!("server error: {message}")).into());
+        }
+        if response != RESP_TUNNEL {
+            let _ = socks5::send_reply(&mut socks_stream, socks5::REP_COMMAND_NOT_SUPPORTED).await;
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "unsupported server response").into(),
+            );
+        }
+
+        socks5::send_reply(&mut socks_stream, socks5::REP_SUCCEEDED).await?;
+
+        if let Err(error) = relay_tcp_to_conn(&mut socks_stream, &mut snell_conn, self.is_v2).await
+        {
+            if !error.is_quiet() {
+                log::warn!("relay error: {error}");
             }
         }
 
         Ok(())
     }
 
-    async fn create_session(&self, target: &str) -> io::Result<SnellConn> {
+    async fn create_session(&self, target: &str) -> Result<SnellConn, SnellError> {
         let stream = TcpStream::connect(&self.server).await?;
-        let (_, server_port) = self.server.rsplit_once(':').unwrap_or(("", &self.server));
+        let (_, server_port) = self
+            .server
+            .rsplit_once(':')
+            .unwrap_or(("", self.server.as_str()));
 
         let mut conn = SnellConn::new_client_conn(
-            stream, self.psk.as_bytes(), &self.obfs, &self.obfs_host, server_port, self.is_v2,
-        )?;
+            stream,
+            self.psk.as_bytes(),
+            &self.obfs,
+            &self.obfs_host,
+            server_port,
+            self.is_v2,
+        );
 
         write_header(&mut conn, target, self.is_v2).await?;
         Ok(conn)
     }
 }
 
-async fn write_header(conn: &mut SnellConn, target: &str, is_v2: bool) -> io::Result<()> {
+async fn write_header(conn: &mut SnellConn, target: &str, is_v2: bool) -> Result<(), SnellError> {
     let (host, port_str) = target.rsplit_once(':').unwrap_or((target, "0"));
-    let port: u16 = port_str.parse().unwrap_or(0);
+    let port: u16 = port_str.parse().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid target port: {target}"),
+        )
+    })?;
+    let host_len = u8::try_from(host.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("target host too long: {target}"),
+        )
+    })?;
 
     let mut buf = Vec::with_capacity(1 + 1 + 1 + 1 + host.len() + 2);
     buf.push(SNELL_VERSION);
     buf.push(if is_v2 { CMD_CONNECT_V2 } else { CMD_CONNECT });
     buf.push(0); // client ID length = 0
-    buf.push(host.len() as u8);
+    buf.push(host_len);
     buf.extend_from_slice(host.as_bytes());
     buf.extend_from_slice(&port.to_be_bytes());
 
@@ -742,9 +917,15 @@ async fn write_header(conn: &mut SnellConn, target: &str, is_v2: bool) -> io::Re
 
 // ---- Relay ----
 
-/// Relay between a SnellConn and a TcpStream (server mode: snell is left, target is right).
-/// Handles half-close: when one direction gets EOF, only shuts down that direction.
-async fn relay_conn_to_tcp(snell: &mut SnellConn, target: TcpStream) -> io::Result<()> {
+/// 在 `SnellConn` 与目标 TCP 之间转发（服务端）。
+///
+/// v2 支持半关闭：客户端用零分片表示发送结束，服务端在目标 EOF 时发送一个零分片，
+/// 两个方向都结束后连接仍可用于下一个请求。v1 没有半关闭，任一方向结束即关闭。
+async fn relay_conn_to_tcp(
+    snell: &mut SnellConn,
+    target: TcpStream,
+    is_v2: bool,
+) -> Result<(), SnellError> {
     let (mut target_read, mut target_write) = tokio::io::split(target);
 
     let mut snell_buf = vec![0u8; RELAY_BUF_SIZE];
@@ -754,84 +935,316 @@ async fn relay_conn_to_tcp(snell: &mut SnellConn, target: TcpStream) -> io::Resu
     let mut target_eof = false;
 
     loop {
-        if snell_eof && target_eof {
-            break Ok(());
+        if is_v2 {
+            if snell_eof && target_eof {
+                break;
+            }
+        } else if snell_eof || target_eof {
+            break;
         }
 
         tokio::select! {
-            r = async { if snell_eof { std::future::pending().await } else { snell.snell_read(&mut snell_buf).await } } => {
-                match r {
-                    Ok(0) => {
+            result = async {
+                if snell_eof {
+                    std::future::pending().await
+                } else {
+                    snell.snell_read(&mut snell_buf).await
+                }
+            } => {
+                match result {
+                    Ok(n) => target_write.write_all(&snell_buf[..n]).await?,
+                    Err(error) if error.is_eof() => {
                         snell_eof = true;
                         let _ = target_write.shutdown().await;
                     }
-                    Ok(n) => {
-                        if let Err(e) = target_write.write_all(&snell_buf[..n]).await {
-                            break Err(e);
-                        }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                        snell_eof = true;
-                        let _ = target_write.shutdown().await;
-                    }
-                    Err(e) => break Err(e),
+                    Err(error) => return Err(error),
                 }
             }
-            r = async { if target_eof { std::future::pending().await } else { target_read.read(&mut target_buf).await } } => {
-                match r {
+            result = async {
+                if target_eof {
+                    std::future::pending().await
+                } else {
+                    target_read.read(&mut target_buf).await
+                }
+            } => {
+                match result {
                     Ok(0) => {
                         target_eof = true;
-                        let _ = snell.write_zero_chunk().await;
-                    }
-                    Ok(n) => {
-                        if let Err(e) = snell.snell_write(&target_buf[..n]).await {
-                            break Err(e);
+                        if is_v2 {
+                            // 必须是 zero chunk：snell_eof 只代表对端方向结束，
+                            // 客户端仍需要这个信号来结束自己的读方向。
+                            snell.write_zero_chunk().await?;
                         }
                     }
-                    Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                        target_eof = true;
-                        let _ = snell.write_zero_chunk().await;
+                    Ok(n) => {
+                        snell.snell_write(&target_buf[..n]).await?;
                     }
-                    Err(e) => break Err(e),
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                        target_eof = true;
+                        if is_v2 {
+                            snell.write_zero_chunk().await?;
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
         }
     }
+
+    Ok(())
 }
 
-/// Relay between a TcpStream (SOCKS client) and a SnellConn (server connection).
-async fn relay_tcp_to_conn(socks: &mut TcpStream, snell: &mut SnellConn) -> io::Result<()> {
+/// 在 SOCKS 客户端与 `SnellConn` 之间转发（客户端）。
+///
+/// v2 支持半关闭：SOCKS 侧 EOF 时向服务端发送零分片，但仍继续读取服务端数据，
+/// 直到服务端也结束；v1 没有半关闭，任一方向结束即关闭。
+async fn relay_tcp_to_conn(
+    socks: &mut TcpStream,
+    snell: &mut SnellConn,
+    is_v2: bool,
+) -> Result<(), SnellError> {
+    let (mut socks_read, mut socks_write) = tokio::io::split(socks);
+
     let mut socks_buf = vec![0u8; RELAY_BUF_SIZE];
     let mut snell_buf = vec![0u8; RELAY_BUF_SIZE];
 
+    let mut socks_eof = false;
+    let mut snell_eof = false;
+
     loop {
+        if is_v2 {
+            if socks_eof && snell_eof {
+                break;
+            }
+        } else if socks_eof || snell_eof {
+            break;
+        }
+
         tokio::select! {
-            r = socks.read(&mut socks_buf) => {
-                match r {
-                    Ok(0) => break Ok(()),
-                    Ok(n) => {
-                        if let Err(e) = snell.snell_write(&socks_buf[..n]).await {
-                            break Err(e);
+            result = async {
+                if socks_eof {
+                    std::future::pending().await
+                } else {
+                    socks_read.read(&mut socks_buf).await
+                }
+            } => {
+                match result {
+                    Ok(0) => {
+                        socks_eof = true;
+                        if is_v2 {
+                            snell.write_zero_chunk().await?;
                         }
                     }
-                    Err(e) => break Err(e),
+                    Ok(n) => {
+                        snell.snell_write(&socks_buf[..n]).await?;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
-            r = snell.snell_read(&mut snell_buf) => {
-                match r {
-                    Ok(0) => break Ok(()),
-                    Ok(n) => {
-                        if let Err(e) = socks.write_all(&snell_buf[..n]).await {
-                            break Err(e);
-                        }
+            result = async {
+                if snell_eof {
+                    std::future::pending().await
+                } else {
+                    snell.snell_read(&mut snell_buf).await
+                }
+            } => {
+                match result {
+                    Ok(n) => socks_write.write_all(&snell_buf[..n]).await?,
+                    Err(error) if error.is_eof() => {
+                        snell_eof = true;
+                        let _ = socks_write.shutdown().await;
                     }
-                    Err(e) => break Err(e),
+                    Err(error) => return Err(error),
                 }
             }
         }
     }
+
+    Ok(())
 }
 
-fn is_zero_chunk(e: &io::Error) -> bool {
-    e.get_ref().map_or(false, |inner| inner.is::<ZeroChunkError>())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    async fn pair(obfs: &str, is_v2: bool) -> (SnellConn, SnellConn) {
+        let (client_stream, server_stream) = tcp_pair().await;
+
+        let client = SnellConn::new_client_conn(
+            client_stream,
+            b"test-psk",
+            obfs,
+            "www.example.com",
+            "443",
+            is_v2,
+        );
+        let server = SnellConn::new_server_conn(server_stream, b"test-psk", obfs);
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn roundtrip_over_all_obfs_modes() {
+        for obfs in ["", "tls", "http"] {
+            let (mut client, mut server) = pair(obfs, true).await;
+
+            client.snell_write(b"hello").await.unwrap();
+            let mut buf = [0u8; 5];
+            server.snell_read(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello", "client -> server over obfs {obfs:?}");
+
+            server.snell_write(b"world").await.unwrap();
+            let mut buf = [0u8; 5];
+            client.snell_read(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"world", "server -> client over obfs {obfs:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_chunk_is_reported_as_stream_end() {
+        let (mut client, mut server) = pair("", true).await;
+
+        client.snell_write(b"x").await.unwrap();
+        let mut buf = [0u8; 1];
+        server.snell_read(&mut buf).await.unwrap();
+
+        client.write_zero_chunk().await.unwrap();
+        let error = server.snell_read(&mut buf).await.unwrap_err();
+        assert!(matches!(error, SnellError::ZeroChunk));
+    }
+
+    #[tokio::test]
+    async fn large_payload_is_reassembled_across_records() {
+        let (mut client, mut server) = pair("", true).await;
+        let payload: Vec<u8> = (0..40_000).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+
+        let writer = tokio::spawn(async move {
+            client.snell_write(&payload).await.unwrap();
+        });
+
+        let mut received = Vec::with_capacity(expected.len());
+        let mut chunk = [0u8; 1024];
+        while received.len() < expected.len() {
+            let n = server.snell_read(&mut chunk).await.unwrap();
+            received.extend_from_slice(&chunk[..n]);
+        }
+        writer.await.unwrap();
+
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn server_falls_back_to_chacha_for_v1_client() {
+        let (mut client, mut server) = pair("", false).await;
+
+        client.snell_write(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        server.snell_read(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+
+        server.snell_write(b"world").await.unwrap();
+        let mut buf = [0u8; 5];
+        client.snell_read(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"world");
+    }
+
+    #[tokio::test]
+    async fn server_relay_propagates_half_close() {
+        let (mut client, mut snell_server) = pair("", true).await;
+        let (mut target_client, target_server) = tcp_pair().await;
+
+        let relay =
+            tokio::spawn(
+                async move { relay_conn_to_tcp(&mut snell_server, target_server, true).await },
+            );
+
+        client.snell_write(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        target_client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        target_client.write_all(b"pong").await.unwrap();
+        target_client.shutdown().await.unwrap();
+
+        let mut buf = [0u8; 4];
+        client.snell_read(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+        // 目标 EOF 后服务端发送零分片
+        let error = client.snell_read(&mut buf).await.unwrap_err();
+        assert!(matches!(error, SnellError::ZeroChunk));
+
+        // 客户端半关闭后中继应正常结束
+        client.write_zero_chunk().await.unwrap();
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_relay_signals_target_eof_after_client_half_close() {
+        let (mut client, mut snell_server) = pair("", true).await;
+        let (mut target_client, target_server) = tcp_pair().await;
+
+        let relay =
+            tokio::spawn(
+                async move { relay_conn_to_tcp(&mut snell_server, target_server, true).await },
+            );
+
+        client.snell_write(b"request").await.unwrap();
+        let mut buf = [0u8; 7];
+        target_client.read_exact(&mut buf).await.unwrap();
+        client.write_zero_chunk().await.unwrap();
+
+        // 客户端先半关闭，目标稍后才 EOF：服务端仍必须发送 zero chunk
+        target_client.write_all(b"response").await.unwrap();
+        target_client.shutdown().await.unwrap();
+
+        let mut buf = [0u8; 8];
+        client.snell_read(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"response");
+        let error = client.snell_read(&mut buf).await.unwrap_err();
+        assert!(matches!(error, SnellError::ZeroChunk));
+
+        relay.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_relay_keeps_reading_after_socks_half_close() {
+        let (mut snell_client, mut snell_server) = pair("", true).await;
+        let (mut socks_user, socks_proxy) = tcp_pair().await;
+
+        let relay = tokio::spawn(async move {
+            let mut socks_proxy = socks_proxy;
+            relay_tcp_to_conn(&mut socks_proxy, &mut snell_client, true).await
+        });
+
+        socks_user.write_all(b"request").await.unwrap();
+        let mut buf = [0u8; 7];
+        snell_server.snell_read(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"request");
+
+        socks_user.shutdown().await.unwrap();
+        let error = snell_server.snell_read(&mut buf).await.unwrap_err();
+        assert!(matches!(error, SnellError::ZeroChunk));
+
+        // 半关闭之后服务端仍可继续下发数据
+        snell_server.snell_write(b"response").await.unwrap();
+        let mut response = [0u8; 8];
+        socks_user.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"response");
+
+        // 服务端结束后，中继关闭 SOCKS 写方向
+        snell_server.write_zero_chunk().await.unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(socks_user.read(&mut byte).await.unwrap(), 0);
+
+        relay.await.unwrap().unwrap();
+    }
 }
