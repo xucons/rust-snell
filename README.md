@@ -21,6 +21,19 @@ cargo build --release
 
 编译产物位于 `target/release/rust-snell`。
 
+## 下载预编译二进制
+
+推送到 `main` 或推送 `v*` 标签后，GitHub Actions 会自动构建 Linux x86_64 产物并发布到 [Releases](https://github.com/xucons/rust-snell/releases)：
+
+| 文件 | 说明 |
+|------|------|
+| `rust-snell-*-linux-x86_64.tar.gz` | 基于 glibc 动态链接，需要较新的 glibc（Ubuntu 22.04+ 等） |
+| `rust-snell-*-linux-x86_64-musl.tar.gz` | 静态链接，可在任意 Linux x86_64 发行版直接运行 |
+
+每个压缩包附带对应的 `.sha256` 校验文件。
+
+推送到 `main` 分支时，产物会持续覆盖 `latest` 滚动版本；推送 `v*` 标签时，会创建对应的正式版本。Actions 页面也可下载当次构建的 artifact。
+
 ## 使用方法
 
 ### 服务端

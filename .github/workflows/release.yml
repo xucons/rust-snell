@@ -1,0 +1,132 @@
+name: Release
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: rust-snell
+
+jobs:
+  build:
+    name: Build Linux x86_64 (${{ matrix.suffix }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
+          - target: x86_64-unknown-linux-musl
+            suffix: linux-x86_64-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify binary
+        run: |
+          BIN="target/${{ matrix.target }}/release/${BINARY_NAME}"
+          file "${BIN}"
+          if [[ "${{ matrix.target }}" == *musl ]]; then
+            if ! file "${BIN}" | grep -Eq "statically linked|static-pie linked"; then
+              echo "::error::musl binary is not statically linked"
+              exit 1
+            fi
+          fi
+
+      - name: Package
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            ARCHIVE="${BINARY_NAME}-${GITHUB_REF_NAME}-${{ matrix.suffix }}.tar.gz"
+          else
+            ARCHIVE="${BINARY_NAME}-${{ matrix.suffix }}.tar.gz"
+          fi
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${BINARY_NAME}" dist/
+          tar -czf "${ARCHIVE}" -C dist "${BINARY_NAME}"
+          sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ matrix.suffix }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Determine release metadata
+        id: meta
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "title=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "note=Linux x86_64 预编译产物，由 GitHub Actions 自动构建。" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            echo "generate_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "title=Latest build (main)" >> "$GITHUB_OUTPUT"
+            echo "note=由 GitHub Actions 自动构建的 \`main\` 分支最新产物。" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            echo "generate_notes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Move rolling tag to current commit
+        if: github.ref_type != 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/latest" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/latest" \
+              -f sha="${GITHUB_SHA}" -F force=true >/dev/null
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.title }}
+          body: |
+            ${{ steps.meta.outputs.note }}
+
+            提交：`${{ github.sha }}`
+          generate_release_notes: ${{ steps.meta.outputs.generate_notes }}
+          make_latest: ${{ steps.meta.outputs.make_latest }}
+          files: artifacts/*
+          fail_on_unmatched_files: true
